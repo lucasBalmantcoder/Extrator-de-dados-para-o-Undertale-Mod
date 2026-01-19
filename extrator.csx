@@ -1,165 +1,302 @@
-// Adapted from original script by Grossley
-using System.Linq;
-using System.Text;
 using System;
 using System.IO;
+using System.Linq;
 using System.Threading;
 using System.Threading.Tasks;
-using UndertaleModLib.Util;
+using System.Collections.Generic;
 using UndertaleModLib;
 using UndertaleModLib.Models;
+using UndertaleModLib.Util;
 
 EnsureDataLoaded();
 
-if (Data.IsYYC())
+ThreadLocal<GlobalDecompileContext> DECOMPILE_CONTEXT =
+    new(() => new GlobalDecompileContext(Data, false));
+
+string baseDir = GetFolder(FilePath);
+string exportDir = Path.Combine(baseDir, "Export_Code");
+
+if (Directory.Exists(exportDir))
 {
-    ScriptError("You cannot do a code dump of a YYC game! There is no code to dump!");
+    ScriptError("Uma exportação de código já existe. Por favor, remova-a.", "Erro");
     return;
 }
 
-ThreadLocal<GlobalDecompileContext> DECOMPILE_CONTEXT = new ThreadLocal<GlobalDecompileContext>(() => new GlobalDecompileContext(Data, false));
+Directory.CreateDirectory(exportDir);
 
-int failed = 0;
+bool exportFromCache = GMLCacheEnabled && Data.GMLCache != null
+    && ScriptQuestion("Exportar do cache?");
 
-string codeFolder = PromptChooseDirectory();
-if (codeFolder == null)
-    throw new ScriptException("The export folder was not set.");
+Dictionary<string, List<(string codeName, string content)>> objetosOrganizados = new();
 
-Directory.CreateDirectory(Path.Combine(codeFolder, "Code"));
-codeFolder = Path.Combine(codeFolder, "Code");
-
-List<string> codeToDump = new();
-List<string> gameObjectCandidates = new();
-List<string> splitStringsList = new();
-string InputtedText = "";
-
-InputtedText = SimpleTextInput("Menu", "Enter object, script, or code entry names", InputtedText, true);
-string[] IndividualLineArray = InputtedText.Split('\n', StringSplitOptions.RemoveEmptyEntries);
-
-foreach (var OneLine in IndividualLineArray)
+// Calcular total de arquivos relevantes
+int totalRelevante = 0;
+if (exportFromCache)
 {
-    splitStringsList.Add(OneLine.Trim());
+    totalRelevante = Data.GMLCache.Count(entry => !DeveIgnorar(entry.Key));
+}
+else
+{
+    totalRelevante = Data.Code.Count(code => 
+        code.ParentEntry == null && !DeveIgnorar(code.Name.Content));
 }
 
-// Match inputs to scripts, codes, and objects
-foreach (var item in splitStringsList)
-{
-    string lowered = item.ToLower();
-
-    foreach (UndertaleGameObject obj in Data.GameObjects)
-    {
-        if (obj.Name.Content.ToLower() == lowered)
-        {
-            gameObjectCandidates.Add(obj.Name.Content);
-        }
-    }
-
-    foreach (UndertaleScript scr in Data.Scripts)
-    {
-        if (scr.Code != null && scr.Name.Content.ToLower() == lowered)
-        {
-            codeToDump.Add(scr.Code.Name.Content);
-        }
-    }
-
-    foreach (UndertaleGlobalInit globalInit in Data.GlobalInitScripts)
-    {
-        if (globalInit.Code != null && globalInit.Code.Name.Content.ToLower() == lowered)
-        {
-            codeToDump.Add(globalInit.Code.Name.Content);
-        }
-    }
-
-    foreach (UndertaleCode code in Data.Code)
-    {
-        if (code.Name.Content.ToLower() == lowered)
-        {
-            codeToDump.Add(code.Name.Content);
-        }
-    }
-}
-
-// Adiciona códigos de eventos dos objetos informados
-foreach (var objName in gameObjectCandidates)
-{
-     try
-    {
-        UndertaleGameObject obj = Data.GameObjects.ByName(objName);
-
-        foreach (var eventList in obj.Events)
-        {
-            foreach (var evnt in eventList)
-            {
-                if (evnt == null) continue;
-
-                foreach (var action in evnt.Actions)
-                {
-                    if (action?.CodeId?.Name?.Content != null)
-                    {
-                        codeToDump.Add(action.CodeId.Name.Content);
-                    }
-                }
-            }
-        }
-    }
-    catch
-    {
-        // Silent catch: object might be malformed or missing data
-    }
-}
-
-SetProgressBar(null, "Exporting Code", 0, codeToDump.Count);
+SetProgressBar(null, "Exportando e Organizando Código", 0, totalRelevante);
 StartProgressBarUpdater();
 
-// Exportação dos códigos decompilados
+if (exportFromCache)
+{
+    await Task.Run(() =>
+    {
+        Parallel.ForEach(Data.GMLCache, entry =>
+        {
+            if (DeveIgnorar(entry.Key))
+            {
+                IncrementProgressParallel();
+                return;
+            }
+            
+            ProcessarCodigo(entry.Key, entry.Value);
+            IncrementProgressParallel();
+        });
+    });
+}
+else
+{
+    await Task.Run(() =>
+    {
+        Parallel.ForEach(Data.Code, code =>
+        {
+            if (code.ParentEntry != null)
+            {
+                IncrementProgressParallel();
+                return;
+            }
+            
+            string codeName = code.Name.Content;
+            if (DeveIgnorar(codeName))
+            {
+                IncrementProgressParallel();
+                return;
+            }
+            
+            try
+            {
+                string output = Decompiler.Decompile(code, DECOMPILE_CONTEXT.Value);
+                ProcessarCodigo(codeName, output);
+            }
+            catch (Exception e)
+            {
+                ProcessarCodigo(codeName,
+                    $"/*\nDECOMPILADOR FALHOU\n\n{e}\n*/");
+            }
+            
+            IncrementProgressParallel();
+        });
+    });
+}
+
+// Agora escreve todos os arquivos organizados em suas pastas
 await Task.Run(() =>
 {
-    foreach (var codeName in codeToDump.Distinct())
+    foreach (var grupo in objetosOrganizados)
     {
-        UndertaleCode code = Data.Code.FirstOrDefault(c => c.Name.Content == codeName);
-        if (code != null)
-            DumpCode(code);
-        else
-            failed++;
+        string nomePasta = grupo.Key;
+        
+        // Se for um script, vai para a pasta Scripts
+        if (nomePasta.StartsWith("Script_"))
+        {
+            nomePasta = "Scripts";
+        }
+        
+        string pastaDestino = Path.Combine(exportDir, nomePasta);
+        Directory.CreateDirectory(pastaDestino);
+        
+        foreach (var arquivo in grupo.Value.OrderBy(a => a.codeName))
+        {
+            string nomeArquivoFinal = arquivo.codeName + ".gml";
+            string caminhoArquivo = Path.Combine(pastaDestino, nomeArquivoFinal);
+            File.WriteAllText(caminhoArquivo, arquivo.content);
+        }
     }
 });
 
 await StopProgressBarUpdater();
+HideProgressBar();
 
-void DumpCode(UndertaleCode code)
+// Mostrar resumo da exportação
+string resumo = "Exportação concluída com sucesso!\n\n";
+resumo += $"Diretório: {exportDir}\n\n";
+resumo += "Estrutura criada:\n";
+
+// Agrupar por categoria para o relatório
+var objetosPorCategoria = objetosOrganizados
+    .Select(kvp => new
+    {
+        Categoria = ExtrairCategoria(kvp.Key),
+        Nome = kvp.Key,
+        Quantidade = kvp.Value.Count,
+        Arquivos = kvp.Value.Select(v => v.codeName).ToList()
+    })
+    .GroupBy(x => x.Categoria)
+    .OrderBy(g => g.Key);
+
+foreach (var categoria in objetosPorCategoria)
 {
-    string safeName = SanitizeFileName(code.Name.Content);
-    string path = Path.Combine(codeFolder, safeName + ".gml");
-
-    try
+    resumo += $"\n{categoria.Key}:\n";
+    foreach (var item in categoria.OrderBy(x => x.Nome))
     {
-        string output = Decompiler.Decompile(code, DECOMPILE_CONTEXT.Value);
-
-        if (code.ParentEntry != null)
-        {
-            string dupFolder = Path.Combine(codeFolder, "Duplicates");
-            Directory.CreateDirectory(dupFolder);
-            path = Path.Combine(dupFolder, safeName + ".gml");
-            output = output.Replace("@@This@@()", "self/*@@This@@()*/");
-        }
-
-        File.WriteAllText(path, output);
+        resumo += $"  {item.Nome}/ ({item.Quantidade} arquivos)\n";
     }
-    catch (Exception e)
-    {
-        string failedDir = Path.Combine(codeFolder, "Failed");
-        Directory.CreateDirectory(failedDir);
-        path = Path.Combine(failedDir, safeName + ".gml");
-        File.WriteAllText(path, $"/*\nDECOMPILER FAILED!\n\n{e}\n*/");
-        failed++;
-    }
-
-    IncrementProgress();
 }
 
-string SanitizeFileName(string name)
+// Mostrar estatísticas
+int totalIgnorado = 0;
+if (exportFromCache)
 {
-    foreach (char c in Path.GetInvalidFileNameChars())
-        name = name.Replace(c, '_');
-    return name;
+    totalIgnorado = Data.GMLCache.Count(entry => DeveIgnorar(entry.Key));
+}
+else
+{
+    totalIgnorado = Data.Code.Count(code => 
+        code.ParentEntry == null && DeveIgnorar(code.Name.Content));
+}
+
+resumo += $"\n\n📊 Estatísticas:\n";
+resumo += $"• Arquivos exportados: {totalRelevante}\n";
+resumo += $"• Arquivos ignorados: {totalIgnorado}\n";
+resumo += $"• Pastas criadas: {objetosOrganizados.Count}\n";
+
+ScriptMessage(resumo);
+
+// ================= FUNÇÕES AUXILIARES =================
+
+bool DeveIgnorar(string codeName)
+{
+    // Ignorar Rooms com padrão RoomCC_ (irrelevantes)
+    if (codeName.StartsWith("gml_RoomCC_"))
+    {
+        return true;
+    }
+    
+    // Opcional: também ignorar outros tipos irrelevantes
+    // if (codeName.StartsWith("gml_Object_obj_irrelevante_"))
+    // {
+    //     return true;
+    // }
+    
+    return false;
+}
+
+void ProcessarCodigo(string codeName, string content)
+{
+    string nomeArquivo = ExtrairNomeArquivo(codeName);
+    
+    lock (objetosOrganizados)
+    {
+        if (!objetosOrganizados.ContainsKey(nomeArquivo))
+        {
+            objetosOrganizados[nomeArquivo] = new List<(string, string)>();
+        }
+        
+        objetosOrganizados[nomeArquivo].Add((codeName, content));
+    }
+}
+
+string ExtrairNomeArquivo(string codeName)
+{
+    if (codeName.StartsWith("gml_Object_"))
+    {
+        if (codeName.StartsWith("gml_Object_PreCreate_") || 
+            codeName.StartsWith("gml_Object_CleanUp_"))
+        {
+            return "objetos";
+        }
+
+        string[] partes = codeName.Split('_');
+
+        if (partes.Length >= 3)
+        {
+            string nomeObjeto = partes[2];
+
+            for (int i = 3; i < partes.Length; i++)
+            {
+                // Se for número (_0, _1, etc), para
+                if (int.TryParse(partes[i], out _))
+                    break;
+
+                // Lista de eventos do GameMaker
+                if (
+                    partes[i] == "Create" ||
+                    partes[i] == "Destroy" ||
+                    partes[i] == "Step" ||
+                    partes[i] == "Draw" ||
+                    partes[i] == "Alarm" ||
+                    partes[i] == "Collision" ||
+                    partes[i] == "Other" ||
+                    partes[i] == "Keyboard" ||
+                    partes[i] == "KeyPress" ||
+                    partes[i] == "KeyRelease" ||
+                    partes[i] == "Mouse" ||
+                    partes[i] == "Gesture" ||
+                    partes[i] == "Async" ||
+                    partes[i] == "PreCreate" ||
+                    partes[i] == "CleanUp"
+                )
+                {
+                    break;
+                }
+
+                nomeObjeto += "_" + partes[i];
+            }
+
+            return nomeObjeto;
+        }
+    }
+
+    else if (codeName.StartsWith("gml_GlobalScript_"))
+    {
+        return "Scripts";
+    }
+    else if (codeName.StartsWith("gml_Script_"))
+    {
+        return "Scripts";
+    }
+    else if (codeName.StartsWith("gml_Room_"))
+    {
+        string nomeRoom = codeName.Substring("gml_Room_".Length);
+        if (nomeRoom.EndsWith("_Create"))
+            nomeRoom = nomeRoom.Replace("_Create", "");
+        return $"Room_{nomeRoom}";
+    }
+
+    return "Outros";
+}
+
+
+string ExtrairCategoria(string nomeArquivo)
+{
+    if (nomeArquivo.StartsWith("obj_"))
+        return "Objetos";
+    else if (nomeArquivo.StartsWith("Script_"))
+        return "Scripts";
+    else if (nomeArquivo.StartsWith("Room_"))
+        return "Rooms";
+    else if (nomeArquivo.StartsWith("Background_"))
+        return "Backgrounds";
+    else if (nomeArquivo.StartsWith("Timeline_"))
+        return "Timelines";
+    else if (nomeArquivo.StartsWith("Path_"))
+        return "Paths";
+    else if (nomeArquivo.StartsWith("Font_"))
+        return "Fonts";
+    else if (nomeArquivo == "objetos")
+        return "Objetos (eventos globais)";
+    else
+        return "Outros";
+}
+
+string GetFolder(string path)
+{
+    return Path.GetDirectoryName(path) + Path.DirectorySeparatorChar;
 }
