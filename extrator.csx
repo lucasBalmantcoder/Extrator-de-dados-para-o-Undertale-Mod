@@ -162,7 +162,7 @@ else
         code.ParentEntry == null && DeveIgnorar(code.Name.Content));
 }
 
-resumo += $"\n\n📊 Estatísticas:\n";
+resumo += $"\n\n Estatísticas:\n";
 resumo += $"• Arquivos exportados: {totalRelevante}\n";
 resumo += $"• Arquivos ignorados: {totalIgnorado}\n";
 resumo += $"• Pastas criadas: {objetosOrganizados.Count}\n";
