@@ -45,12 +45,13 @@ Os arquivos extraídos são organizados por **objeto**, e dentro de cada pasta o
 1. Baixe o **jogo ou mod de Undertale** que deseja estudar  
 2. Abra o projeto no **GameMaker**
 3. Vá até:
-
+```bash
 Scripts → Run Other Scripts
+```
 4. Selecione o arquivo:
-
+```bash
 extrator.csx
-
+```
 5. Aguarde a execução do script
 
 Ao final do processo:
